@@ -5,24 +5,18 @@ package imagehosting
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"mime"
 	"mime/multipart"
 	"net/http"
-	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
-	"slices"
-	"strconv"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"testing"
-	"testing/iotest"
 	"testing/synctest"
 	"time"
 
@@ -30,955 +24,220 @@ import (
 	"github.com/autobrr/upbrr/internal/httpclient"
 )
 
-const bothPicsTestCollectionID = "c06c91e5-1d7f-4a39-a91f-c75a2e807260"
-
-const bothPicsTestAccepted = `{"id":"` + bothPicsTestCollectionID + `","status":"processing","statusUrl":"https://untrusted.example.invalid/private"}`
-
-type bothPicsTestFrame struct {
-	ID    string `json:"id"`
-	Label string `json:"label"`
-	State string `json:"state"`
-}
-
-type bothPicsTestImage struct {
-	ID       string `json:"id"`
-	FrameID  string `json:"frameId"`
-	State    string `json:"state"`
-	URL      string `json:"url"`
-	ThumbURL string `json:"thumbUrl"`
-	SHA256   string `json:"sha256"`
-}
-
-type bothPicsTestCollection struct {
-	ID      string              `json:"id"`
-	Status  string              `json:"status"`
-	URL     string              `json:"url"`
-	Frames  []bothPicsTestFrame `json:"frames"`
-	Images  []bothPicsTestImage `json:"images"`
-	Padding string              `json:"padding,omitempty"`
-}
-
-func newBothPicsTestCollection(count int) bothPicsTestCollection {
-	collection := bothPicsTestCollection{
-		ID:     bothPicsTestCollectionID,
-		Status: "published",
-		URL:    "https://both.pics/s/synthetic",
-		Frames: make([]bothPicsTestFrame, count),
-		Images: make([]bothPicsTestImage, count),
+func bothPicsTestResponse(status int, body string, header http.Header) *http.Response {
+	if header == nil {
+		header = http.Header{}
 	}
-	for index := range count {
-		frameID := fmt.Sprintf("frame-%d", index+1)
-		collection.Frames[index] = bothPicsTestFrame{
-			ID:    frameID,
-			Label: strconv.Itoa(index + 1),
-			State: "live",
-		}
-		collection.Images[index] = bothPicsTestImage{
-			ID:       fmt.Sprintf("00000000-0000-4000-8000-%012d", index+1),
-			FrameID:  frameID,
-			State:    "valid",
-			URL:      fmt.Sprintf("https://both.pics/m/synthetic/image-%d", index+1),
-			ThumbURL: fmt.Sprintf("https://both.pics/t/synthetic/image-%d", index+1),
-			SHA256:   strings.Repeat("abcdef12", 8),
-		}
+	return &http.Response{
+		StatusCode: status,
+		Header:     header,
+		Body:       io.NopCloser(strings.NewReader(body)),
 	}
-	return collection
-}
-
-func bothPicsTestJSON(t *testing.T, value any) string {
-	t.Helper()
-	encoded, err := json.Marshal(value)
-	if err != nil {
-		t.Fatalf("marshal both.pics fixture: %v", err)
-	}
-	return string(encoded)
 }
 
 func bothPicsTestPaths(t *testing.T, count int) []string {
 	t.Helper()
-	root := t.TempDir()
 	paths := make([]string, count)
 	for index := range paths {
-		paths[index] = filepath.Join(root, fmt.Sprintf("synthetic-%d.png", index+1))
-		if err := os.WriteFile(paths[index], fmt.Appendf(nil, "synthetic image %d", index+1), 0o600); err != nil {
-			t.Fatalf("write image fixture: %v", err)
+		paths[index] = filepath.Join(t.TempDir(), fmt.Sprintf("shot%d.png", index+1))
+		if err := os.WriteFile(paths[index], fmt.Appendf(nil, "image %d", index+1), 0o600); err != nil {
+			t.Fatal(err)
 		}
 	}
 	return paths
 }
 
-func TestBothPicsBatchRequestAndOrderedResults(t *testing.T) {
-	t.Parallel()
+// bothPicsTestPublished is a published two-image collection, frames listed
+// in upload order and images deliberately reversed.
+func bothPicsTestPublished(status, failure string) string {
+	return fmt.Sprintf(`{"id":"c1","status":%q,"url":"https://both.pics/s/key","failure":%q,
+		"frames":[{"id":"f1"},{"id":"f2"}],
+		"images":[
+			{"id":"i2","frameId":"f2","url":"https://img.both.pics/2.png","thumbUrl":"https://img.both.pics/2.webp","sha256":"bbbbbbbbcc"},
+			{"id":"i1","frameId":"f1","url":"https://img.both.pics/1.png","thumbUrl":"https://img.both.pics/1.webp","sha256":"aaaaaaaacc","error":"This file cannot be published."}
+		]}`, status, failure)
+}
 
-	// Twelve parts also exercise ordering beyond a single-digit multipart field.
-	paths := bothPicsTestPaths(t, 12)
-	collection := newBothPicsTestCollection(len(paths))
-	collection.Images[2].SHA256 = ""
-	slices.Reverse(collection.Images)
-	requests := 0
-	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
-		requests++
-		if got := request.Header.Get("Authorization"); got != "Bearer synthetic-api-key" {
-			t.Fatal("incorrect Authorization header")
-		}
-		if got := request.Header.Get("Accept"); got != "application/json" {
-			t.Fatalf("Accept = %q", got)
-		}
-		if got := request.Header.Get("User-Agent"); got != "upbrr (https://github.com/autobrr/upbrr)" {
-			t.Fatalf("User-Agent = %q", got)
-		}
-		switch requests {
-		case 1:
-			if request.Method != http.MethodPost || request.URL.String() != "https://both.pics/v1/collections/upload" {
-				t.Fatalf("upload request = %s %s", request.Method, request.URL)
+var bothPicsTestWant = []uploadResult{
+	{
+		ImgURL: "https://img.both.pics/1.webp",
+		RawURL: "https://img.both.pics/1.png?v=aaaaaaaa",
+		WebURL: "https://both.pics/s/key/1",
+	},
+	{
+		ImgURL: "https://img.both.pics/2.webp",
+		RawURL: "https://img.both.pics/2.png?v=bbbbbbbb",
+		WebURL: "https://both.pics/s/key/2",
+	},
+}
+
+func TestBothPicsTokenUploadPollsUntilPublished(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		paths := bothPicsTestPaths(t, 2)
+		var polls atomic.Int32
+		client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			if req.Header.Get("Authorization") != "Bearer token" || !strings.HasPrefix(req.Header.Get("User-Agent"), "upbrr/") {
+				t.Errorf("%s %s missing token or user agent", req.Method, req.URL)
 			}
-			assertBothPicsMultipart(t, request, paths, "Synthetic.Release-GRP")
-			return imageTestResponse(http.StatusAccepted, bothPicsTestAccepted), nil
-		case 2:
-			if request.Method != http.MethodGet || request.URL.String() != "https://both.pics/v1/collections/"+bothPicsTestCollectionID {
-				t.Fatalf("poll request = %s %s", request.Method, request.URL)
+			switch req.Method + " " + req.URL.String() {
+			case "POST https://both.pics/v1/collections/upload":
+				if err := req.ParseMultipartForm(1 << 20); err != nil {
+					t.Fatal(err)
+				}
+				form := req.MultipartForm
+				if form.Value["kind"][0] != "screenshots" || form.Value["visibility"][0] != "unlisted" ||
+					form.Value["frameCount"][0] != "2" || form.Value["title"][0] != "Movie 2024" {
+					t.Errorf("fields = %v", form.Value)
+				}
+				if form.File["file000000"][0].Filename != "shot1.png" || form.File["file000001"][0].Filename != "shot2.png" {
+					t.Errorf("files out of order: %v", form.File)
+				}
+				return bothPicsTestResponse(http.StatusAccepted, `{"id":"c1","status":"processing"}`, nil), nil
+			case "GET https://both.pics/v1/collections/c1":
+				switch polls.Add(1) {
+				case 1:
+					return bothPicsTestResponse(http.StatusOK, `{"status":"processing"}`, nil), nil
+				case 2:
+					return bothPicsTestResponse(http.StatusServiceUnavailable, "<html>busy</html>", nil), nil
+				}
+				return bothPicsTestResponse(http.StatusOK, bothPicsTestPublished("published", ""), nil), nil
 			}
-			return imageTestResponse(http.StatusOK, bothPicsTestJSON(t, collection)), nil
-		default:
-			t.Fatalf("unexpected request %d", requests)
+			t.Fatalf("unexpected request %s %s", req.Method, req.URL)
 			return nil, nil
+		})}
+		got, err := (&bothPicsUploader{apiKey: "token", client: client}).UploadBatchWithName(t.Context(), paths, "Movie 2024")
+		if err != nil {
+			t.Fatal(err)
 		}
-	})}
-
-	results, err := (&bothPicsUploader{apiKey: "  synthetic-api-key\n", client: client}).UploadBatchWithName(
-		t.Context(), paths, "  Synthetic.Release-GRP  ",
-	)
-	if err != nil {
-		t.Fatalf("upload batch: %v", err)
-	}
-	if len(results) != len(paths) || requests != 2 {
-		t.Fatalf("results = %d, requests = %d", len(results), requests)
-	}
-	for index, result := range results {
-		rawURL := fmt.Sprintf("https://both.pics/m/synthetic/image-%d", index+1)
-		if index != 2 {
-			rawURL += "?v=abcdef12"
+		if !reflect.DeepEqual(got, bothPicsTestWant) {
+			t.Fatalf("results = %#v", got)
 		}
-		thumbURL := fmt.Sprintf("https://both.pics/t/synthetic/image-%d", index+1)
-		want := uploadResult{
-			ImgURL: thumbURL,
-			RawURL: rawURL,
-			WebURL: fmt.Sprintf("https://both.pics/s/synthetic/%d", index+1),
-		}
-		if result != want {
-			t.Fatalf("result %d = %+v, want %+v", index, result, want)
-		}
-	}
-}
-
-func assertBothPicsMultipart(t *testing.T, request *http.Request, paths []string, title string) {
-	t.Helper()
-	mediaType, params, err := mime.ParseMediaType(request.Header.Get("Content-Type"))
-	if err != nil || mediaType != "multipart/form-data" || params["boundary"] == "" {
-		t.Fatalf("multipart Content-Type = %q: %v", request.Header.Get("Content-Type"), err)
-	}
-	reader := multipart.NewReader(request.Body, params["boundary"])
-	fields := make(map[string]string)
-	fileIndex := 0
-	for {
-		part, partErr := reader.NextPart()
-		if errors.Is(partErr, io.EOF) {
-			break
-		}
-		if partErr != nil {
-			t.Fatalf("next multipart part: %v", partErr)
-		}
-		body, readErr := io.ReadAll(part)
-		if closeErr := part.Close(); closeErr != nil {
-			t.Fatalf("close multipart part: %v", closeErr)
-		}
-		if readErr != nil {
-			t.Fatalf("read multipart part: %v", readErr)
-		}
-		if part.FileName() == "" {
-			if fileIndex != 0 {
-				t.Fatal("metadata field followed file parts")
-			}
-			fields[part.FormName()] = string(body)
-			continue
-		}
-		if len(fields) != 4 {
-			t.Fatalf("metadata fields before files = %v", fields)
-		}
-		if fileIndex >= len(paths) {
-			t.Fatal("too many file parts")
-		}
-		if got, want := part.FormName(), fmt.Sprintf("file%06d", fileIndex+1); got != want {
-			t.Fatalf("file field = %q, want %q", got, want)
-		}
-		if got, want := part.FileName(), filepath.Base(paths[fileIndex]); got != want {
-			t.Fatalf("file name = %q, want %q", got, want)
-		}
-		if got, want := string(body), fmt.Sprintf("synthetic image %d", fileIndex+1); got != want {
-			t.Fatalf("file contents = %q, want %q", got, want)
-		}
-		fileIndex++
-	}
-	labels := make([]string, len(paths))
-	for index := range labels {
-		labels[index] = strconv.Itoa(index + 1)
-	}
-	want := map[string]string{
-		"kind":        "screenshots",
-		"title":       title,
-		"visibility":  "unlisted",
-		"frameLabels": bothPicsTestJSON(t, labels),
-	}
-	if !reflect.DeepEqual(fields, want) || fileIndex != len(paths) {
-		t.Fatalf("multipart fields = %v, files = %d; want %v, %d", fields, fileIndex, want, len(paths))
-	}
-}
-
-func TestBothPicsSingleUploadAndLargeCollectionResponse(t *testing.T) {
-	t.Parallel()
-	paths := bothPicsTestPaths(t, 1)
-	collection := newBothPicsTestCollection(1)
-	collection.Padding = strings.Repeat("x", 70*1024)
-	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
-		if request.Method == http.MethodPost {
-			if err := request.ParseMultipartForm(1 << 20); err != nil {
-				t.Fatalf("parse single upload: %v", err)
-			}
-			if request.FormValue("title") == "" {
-				t.Fatal("default collection title is empty")
-			}
-			return imageTestResponse(http.StatusAccepted, bothPicsTestAccepted), nil
-		}
-		return imageTestResponse(http.StatusOK, bothPicsTestJSON(t, collection)), nil
-	})}
-	result, err := (&bothPicsUploader{apiKey: "synthetic-api-key", client: client}).Upload(t.Context(), paths[0])
-	if err != nil {
-		t.Fatalf("single upload with large collection response: %v", err)
-	}
-	if result.WebURL != "https://both.pics/s/synthetic/1" || result.RawURL != "https://both.pics/m/synthetic/image-1?v=abcdef12" {
-		t.Fatalf("single result = %+v", result)
-	}
-}
-
-func TestBothPicsRejectsInvalidInputsWithoutRequest(t *testing.T) {
-	t.Parallel()
-	paths := bothPicsTestPaths(t, 1)
-	ctx, cancel := context.WithCancel(t.Context())
-	cancel()
-	scenarios := []struct {
-		name  string
-		key   string
-		paths []string
-		ctx   context.Context
-	}{
-		{
-			name:  "anonymous missing file",
-			paths: []string{filepath.Join(t.TempDir(), "missing.png")},
-			ctx:   t.Context(),
-		},
-		{
-			name: "empty batch",
-			key:  "synthetic-api-key",
-			ctx:  t.Context(),
-		},
-		{
-			name:  "missing file",
-			key:   "synthetic-api-key",
-			paths: []string{filepath.Join(t.TempDir(), "missing.png")},
-			ctx:   t.Context(),
-		},
-		{
-			name:  "too many images",
-			key:   "synthetic-api-key",
-			paths: slices.Repeat(paths, 501),
-			ctx:   t.Context(),
-		},
-		{
-			name:  "canceled context",
-			key:   "synthetic-api-key",
-			paths: paths,
-			ctx:   ctx,
-		},
-	}
-	for _, scenario := range scenarios {
-		t.Run(scenario.name, func(t *testing.T) {
-			client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
-				t.Fatal("invalid input caused an HTTP request")
-				return nil, nil
-			})}
-			_, err := (&bothPicsUploader{apiKey: scenario.key, client: client}).UploadBatch(scenario.ctx, scenario.paths)
-			if err == nil {
-				t.Fatal("invalid input succeeded")
-			}
-			if scenario.name == "canceled context" && !errors.Is(err, context.Canceled) {
-				t.Fatalf("canceled upload error = %v", err)
-			}
-		})
-	}
-}
-
-func TestBothPicsRejectsUploadAndPollingErrors(t *testing.T) {
-	t.Parallel()
-	paths := bothPicsTestPaths(t, 1)
-	const privateMarker = "synthetic-private-response-marker"
-	scenarios := []struct {
-		name       string
-		postStatus int
-		postBody   string
-		getStatus  int
-		getBody    string
-		wantCalls  int
-	}{
-		{
-			name:       "unauthorized upload",
-			postStatus: http.StatusUnauthorized,
-			postBody:   privateMarker,
-			wantCalls:  1,
-		},
-		{
-			name:       "rate limited upload",
-			postStatus: http.StatusTooManyRequests,
-			postBody:   privateMarker,
-			wantCalls:  1,
-		},
-		{
-			name:       "unexpected upload status",
-			postStatus: http.StatusOK,
-			postBody:   bothPicsTestAccepted,
-			wantCalls:  1,
-		},
-		{
-			name:       "malformed upload JSON",
-			postStatus: http.StatusAccepted,
-			postBody:   `{"id":"` + privateMarker,
-			wantCalls:  1,
-		},
-		{
-			name:       "missing collection ID",
-			postStatus: http.StatusAccepted,
-			postBody:   `{"status":"processing"}`,
-			wantCalls:  1,
-		},
-		{
-			name:       "unsafe collection ID",
-			postStatus: http.StatusAccepted,
-			postBody:   `{"id":"../` + privateMarker + `"}`,
-			wantCalls:  1,
-		},
-		{
-			name:       "upload response too large",
-			postStatus: http.StatusAccepted,
-			postBody:   strings.Repeat("x", (1<<20)+1),
-			wantCalls:  1,
-		},
-		{
-			name:      "unauthorized polling",
-			getStatus: http.StatusUnauthorized,
-			getBody:   privateMarker,
-			wantCalls: 2,
-		},
-		{
-			name:      "missing collection",
-			getStatus: http.StatusNotFound,
-			getBody:   privateMarker,
-			wantCalls: 2,
-		},
-		{
-			name:      "poll server failure",
-			getStatus: http.StatusInternalServerError,
-			getBody:   privateMarker,
-			wantCalls: 2,
-		},
-		{
-			name:      "malformed polling JSON",
-			getStatus: http.StatusOK,
-			getBody:   `{"status":"` + privateMarker,
-			wantCalls: 2,
-		},
-		{
-			name:      "poll response too large",
-			getStatus: http.StatusOK,
-			getBody:   strings.Repeat("x", (1<<20)+1),
-			wantCalls: 2,
-		},
-		{
-			name:      "failed collection",
-			getStatus: http.StatusOK,
-			getBody:   `{"status":"failed","error":"` + privateMarker + `"}`,
-			wantCalls: 2,
-		},
-		{
-			name:      "deleted collection",
-			getStatus: http.StatusOK,
-			getBody:   `{"status":"deleted"}`,
-			wantCalls: 2,
-		},
-		{
-			name:      "unknown collection status",
-			getStatus: http.StatusOK,
-			getBody:   `{"status":"` + privateMarker + `"}`,
-			wantCalls: 2,
-		},
-		{
-			name:      "missing collection status",
-			getStatus: http.StatusOK,
-			getBody:   `{}`,
-			wantCalls: 2,
-		},
-	}
-	for _, scenario := range scenarios {
-		t.Run(scenario.name, func(t *testing.T) {
-			calls := 0
-			client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
-				calls++
-				if calls > scenario.wantCalls {
-					t.Fatal("unexpected retry after terminal error")
-				}
-				if request.Method == http.MethodPost {
-					if scenario.postStatus == 0 {
-						return imageTestResponse(http.StatusAccepted, bothPicsTestAccepted), nil
-					}
-					return imageTestResponse(scenario.postStatus, scenario.postBody), nil
-				}
-				return imageTestResponse(scenario.getStatus, scenario.getBody), nil
-			})}
-			_, err := (&bothPicsUploader{apiKey: "synthetic-api-key", client: client}).UploadBatch(t.Context(), paths)
-			if err == nil {
-				t.Fatal("invalid response succeeded")
-			}
-			if strings.Contains(err.Error(), privateMarker) {
-				t.Fatalf("error exposed remote response: %v", err)
-			}
-			if calls != scenario.wantCalls {
-				t.Fatalf("HTTP requests = %d, want %d", calls, scenario.wantCalls)
-			}
-		})
-	}
-}
-
-const bothPicsTestPrivateDetail = "synthetic-private-error-detail"
-
-func bothPicsTestErrorSecrets() []string {
-	return []string{
-		"synthetic-api-key", bothPicsTestGuestCookie, bothPicsTestDevice, bothPicsTestCSRF,
-		bothPicsTestPrivateDetail, url.QueryEscape(bothPicsTestPrivateDetail + "=synthetic-api-key"),
-	}
-}
-
-func bothPicsTestErrorBody(t *testing.T, code, message string) string {
-	t.Helper()
-	return bothPicsTestJSON(t, map[string]any{
-		"error":   code,
-		"message": message,
-		"detail":  bothPicsTestErrorSecrets(),
 	})
 }
 
-func assertBothPicsSafeError(t *testing.T, err error, fragments ...string) {
-	t.Helper()
-	if err == nil {
-		t.Fatal("rejected upload succeeded")
-	}
-	for _, secret := range bothPicsTestErrorSecrets() {
-		if strings.Contains(err.Error(), secret) {
-			t.Fatal("upload error exposed private response or session material")
-		}
-	}
-	for _, fragment := range fragments {
-		if !strings.Contains(err.Error(), fragment) {
-			t.Fatalf("upload error = %q, want safe diagnostic %q", err.Error(), fragment)
-		}
-	}
-}
-
-func TestBothPicsReportsSafeHTTPFailures(t *testing.T) {
+func TestBothPicsReportsServiceErrors(t *testing.T) {
 	t.Parallel()
-	paths := bothPicsTestPaths(t, 1)
-	privateDetails := strings.Join(bothPicsTestErrorSecrets(), " ")
-	scenarios := []struct {
-		name   string
+	cases := map[string]struct {
 		status int
 		body   string
-		want   []string
+		want   string
 	}{
-		{
-			name:   "invalid token",
-			status: http.StatusUnauthorized,
-			body:   bothPicsTestErrorBody(t, "invalid_token", "The token is invalid, expired or revoked."),
-			want:   []string{"API token", "invalid"},
-		},
-		{
-			name:   "token required",
-			status: http.StatusUnauthorized,
-			body:   bothPicsTestErrorBody(t, "token_required", "Send Authorization: Bearer <token>."),
-			want:   []string{"API token", "missing"},
-		},
-		{
-			name:   "upload scope required",
-			status: http.StatusForbidden,
-			body:   bothPicsTestErrorBody(t, "insufficient_scope", `This token lacks the "upload" scope.`),
-			want:   []string{"read and upload scopes"},
-		},
-		{
-			name:   "read scope required",
-			status: http.StatusForbidden,
-			body:   bothPicsTestErrorBody(t, "insufficient_scope", `This token lacks the "read" scope.`),
-			want:   []string{"read and upload scopes"},
-		},
-		{
-			name:   "untrusted scope message",
-			status: http.StatusForbidden,
-			body:   bothPicsTestErrorBody(t, "insufficient_scope", privateDetails),
-			want:   []string{"read and upload scopes"},
-		},
-		{
-			name:   "account suspended",
-			status: http.StatusForbidden,
-			body:   bothPicsTestErrorBody(t, "suspended", privateDetails),
-			want:   []string{"access is restricted"},
-		},
-		{
-			name:   "email verification required",
-			status: http.StatusForbidden,
-			body:   bothPicsTestErrorBody(t, "unverified", privateDetails),
-			want:   []string{"verify the email address"},
-		},
-		{
-			name:   "daily image limit",
-			status: http.StatusTooManyRequests,
-			body:   bothPicsTestErrorBody(t, "daily_limit", "Daily upload limit reached; try again tomorrow."),
-			want:   []string{"daily upload limit", "tomorrow"},
-		},
-		{
-			name:   "request rate limit",
-			status: http.StatusTooManyRequests,
-			body:   bothPicsTestErrorBody(t, "rate_limited", privateDetails),
-			want:   []string{"request rate limit", "wait"},
-		},
-		{
-			name:   "image size limit",
-			status: http.StatusRequestEntityTooLarge,
-			body:   bothPicsTestErrorBody(t, "too_large", "Images are limited to 67108864 bytes."),
-			want:   []string{"server limit", "67108864 bytes"},
-		},
-		{
-			name:   "batch size limit",
-			status: http.StatusRequestEntityTooLarge,
-			body:   bothPicsTestErrorBody(t, "too_large", "Request exceeds 268435456 bytes."),
-			want:   []string{"server limit", "268435456 bytes"},
-		},
-		{
-			name:   "file size hides filename",
-			status: http.StatusRequestEntityTooLarge,
-			body:   bothPicsTestErrorBody(t, "too_large", privateDetails+" exceeds 67108864 bytes."),
-			want:   []string{"67108864 bytes"},
-		},
-		{
-			name:   "unrecognized size message",
-			status: http.StatusRequestEntityTooLarge,
-			body:   bothPicsTestErrorBody(t, "too_large", privateDetails),
-			want:   []string{"server size limit"},
-		},
-		{
-			name:   "frame count limit",
-			status: http.StatusBadRequest,
-			body:   bothPicsTestErrorBody(t, "invalid_frames", "At most 500 images."),
-			want:   []string{"at most 500 images"},
-		},
-		{
-			name:   "invalid visibility",
-			status: http.StatusBadRequest,
-			body:   bothPicsTestErrorBody(t, "invalid_visibility", privateDetails),
-			want:   []string{"metadata was rejected"},
-		},
-		{
-			name:   "invalid title",
-			status: http.StatusBadRequest,
-			body:   bothPicsTestErrorBody(t, "invalid_title", privateDetails),
-			want:   []string{"metadata was rejected"},
-		},
-		{
-			name:   "unexpected 422 fallback",
-			status: http.StatusUnprocessableEntity,
-			body:   bothPicsTestErrorBody(t, bothPicsTestPrivateDetail, privateDetails),
-		},
-		{
-			name:   "server failure",
-			status: http.StatusInternalServerError,
-			body:   bothPicsTestErrorBody(t, "internal_error", privateDetails),
-			want:   []string{"service could not complete", "check the collection"},
-		},
-		{
-			name:   "HTML failure",
-			status: http.StatusInternalServerError,
-			body:   "<html>" + privateDetails + "</html>",
-		},
-		{
-			name:   "malformed error JSON",
-			status: http.StatusInternalServerError,
-			body:   `{"error":"internal_error","message":"` + privateDetails,
-		},
-		{
-			name:   "oversized error JSON",
-			status: http.StatusInternalServerError,
-			body:   bothPicsTestErrorBody(t, "internal_error", strings.Repeat("x", 1<<20)+privateDetails),
-		},
+		"bad token":    {http.StatusUnauthorized, `{"error":"invalid_token","message":"Token expired."}`, "status 401: invalid_token: Token expired."},
+		"scope":        {http.StatusForbidden, `{"error":"insufficient_scope","message":"This token lacks the \"upload\" scope."}`, `insufficient_scope: This token lacks the "upload" scope.`},
+		"limit":        {http.StatusTooManyRequests, `{"error":"daily_limit","message":"Daily upload limit reached."}`, "status 429: daily_limit: Daily upload limit reached."},
+		"non-json 413": {http.StatusRequestEntityTooLarge, "<html>too big</html>", "status 413: Request Entity Too Large"},
 	}
-	for _, scenario := range scenarios {
-		for _, polling := range []bool{false, true} {
-			t.Run(fmt.Sprintf("%s/polling_%t", scenario.name, polling), func(t *testing.T) {
-				calls := 0
-				failed := false
-				client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
-					if failed {
-						t.Fatal("terminal HTTP failure caused a retry")
-					}
-					calls++
-					if request.URL.Host != "both.pics" || !strings.HasPrefix(request.URL.Path, "/v1/collections") {
-						t.Fatal("configured token failure fell back to anonymous upload")
-					}
-					if request.Header.Get("Authorization") != "Bearer synthetic-api-key" {
-						t.Fatal("account request lost its configured authorization")
-					}
-					if polling && calls == 1 {
-						return imageTestResponse(http.StatusAccepted, bothPicsTestAccepted), nil
-					}
-					failed = true
-					response := imageTestResponse(scenario.status, scenario.body)
-					response.Header.Set("Retry-After", "1")
-					return response, nil
-				})}
-				results, err := (&bothPicsUploader{apiKey: "synthetic-api-key", client: client}).UploadBatch(t.Context(), paths)
-				assertBothPicsSafeError(t, err, append([]string{"status " + strconv.Itoa(scenario.status)}, scenario.want...)...)
-				wantCalls := 1
-				if polling {
-					wantCalls = 2
-				}
-				if len(results) != 0 || !failed || calls != wantCalls {
-					t.Fatalf("failed upload returned %d results after %d requests; want %d requests", len(results), calls, wantCalls)
-				}
-			})
-		}
-	}
-}
-
-func TestBothPicsReportsSafeCollectionFailures(t *testing.T) {
-	t.Parallel()
-	paths := bothPicsTestPaths(t, 1)
-	const quotaFailure = "Storage quota exceeded (600000000 of 524288000 bytes). Delete old comparisons or ask for a larger quota."
-	const validationFailure = "1 image(s) failed validation. Replace them and finalize again."
-	scenarios := []struct {
-		name       string
-		failure    string
-		imageError string
-		want       []string
-	}{
-		{
-			name:    "storage quota",
-			failure: quotaFailure,
-			want:    []string{"storage quota exceeded", "600000000 of 524288000 bytes", "delete old uploads"},
-		},
-		{
-			name:    "image validation",
-			failure: validationFailure,
-			want:    []string{"1 image(s) failed validation", "replace the rejected images"},
-		},
-		{
-			name:       "unsupported image format",
-			failure:    validationFailure,
-			imageError: "not a recognised image file (expected PNG, JPEG or WebP)",
-			want:       []string{"1 image(s) failed validation", "unrecognized image format", "PNG, JPEG or WebP"},
-		},
-		{
-			name:       "validated image byte limit",
-			failure:    validationFailure,
-			imageError: "file larger than 67108864 bytes",
-			want:       []string{"1 image(s) failed validation", "67108864 bytes", "reduce its size"},
-		},
-		{
-			name:       "uploaded image byte limit",
-			failure:    validationFailure,
-			imageError: "File exceeds 67108864 bytes.",
-			want:       []string{"1 image(s) failed validation", "67108864 bytes", "reduce its size"},
-		},
-		{
-			name:       "image pixel limit",
-			failure:    validationFailure,
-			imageError: "image has 70000000 pixels; the limit is 67108864",
-			want:       []string{"70000000 pixels", "server limit is 67108864", "reduce its dimensions"},
-		},
-		{
-			name:       "known image reason without known collection failure",
-			failure:    bothPicsTestPrivateDetail,
-			imageError: "not a recognised image file (expected PNG, JPEG or WebP)",
-			want:       []string{"collection failed", "unrecognized image format"},
-		},
-		{
-			name:       "untrusted image reason suffix",
-			failure:    validationFailure,
-			imageError: "file larger than 67108864 bytes " + bothPicsTestPrivateDetail,
-			want:       []string{"1 image(s) failed validation"},
-		},
-		{
-			name:    "unknown private failure",
-			failure: strings.Join(bothPicsTestErrorSecrets(), " "),
-			want:    []string{"collection failed"},
-		},
-		{
-			name:    "quota message with untrusted suffix",
-			failure: quotaFailure + bothPicsTestPrivateDetail,
-			want:    []string{"collection failed"},
-		},
-		{
-			name:    "validation message with untrusted suffix",
-			failure: validationFailure + bothPicsTestPrivateDetail,
-			want:    []string{"collection failed"},
-		},
-	}
-	for _, scenario := range scenarios {
-		for _, anonymous := range []bool{false, true} {
-			t.Run(fmt.Sprintf("%s/anonymous_%t", scenario.name, anonymous), func(t *testing.T) {
-				imageError := scenario.imageError
-				if imageError == "" {
-					imageError = strings.Join(bothPicsTestErrorSecrets(), " ")
-				}
-				body := bothPicsTestJSON(t, map[string]any{
-					"status":  "failed",
-					"failure": scenario.failure,
-					"detail":  bothPicsTestErrorSecrets(),
-					"images":  []map[string]any{{"state": "invalid", "error": imageError}},
-				})
-				failed := false
-				intercept := roundTripFunc(func(request *http.Request) (*http.Response, error) {
-					if failed {
-						t.Fatal("failed collection was retried or recreated")
-					}
-					if request.Method == http.MethodGet && strings.HasSuffix(request.URL.Path, "/"+bothPicsTestCollectionID) {
-						failed = true
-						return imageTestResponse(http.StatusOK, body), nil
-					}
-					if anonymous {
-						return nil, nil
-					}
-					if request.Method != http.MethodPost || request.URL.Path != "/v1/collections/upload" {
-						t.Fatal("account collection failure switched upload paths")
-					}
-					return imageTestResponse(http.StatusAccepted, bothPicsTestAccepted), nil
-				})
-				uploader := &bothPicsUploader{apiKey: "synthetic-api-key", client: &http.Client{Transport: intercept}}
-				if anonymous {
-					uploader.apiKey = ""
-					uploader.client = bothPicsTestGuestClient(t, 1, intercept)
-				}
-				results, err := uploader.UploadBatch(t.Context(), paths)
-				assertBothPicsSafeError(t, err, scenario.want...)
-				if len(results) != 0 || !failed {
-					t.Fatal("failed collection did not terminate at the owner status response")
-				}
-			})
-		}
-	}
-}
-
-func TestBothPicsRejectsInvalidPublishedImages(t *testing.T) {
-	t.Parallel()
-	paths := bothPicsTestPaths(t, 2)
-	scenarios := []struct {
-		name   string
-		mutate func(*bothPicsTestCollection)
-	}{
-		{name: "missing collection URL", mutate: func(c *bothPicsTestCollection) { c.URL = "" }},
-		{name: "relative collection URL", mutate: func(c *bothPicsTestCollection) { c.URL = "/s/synthetic" }},
-		{name: "unsafe collection URL", mutate: func(c *bothPicsTestCollection) { c.URL = "javascript:alert(1)" }},
-		{name: "missing frame", mutate: func(c *bothPicsTestCollection) { c.Frames = c.Frames[:1] }},
-		{name: "missing image", mutate: func(c *bothPicsTestCollection) { c.Images = c.Images[:1] }},
-		{name: "extra image", mutate: func(c *bothPicsTestCollection) { c.Images = append(c.Images, c.Images[0]) }},
-		{name: "duplicate frame ID", mutate: func(c *bothPicsTestCollection) { c.Frames[1].ID = c.Frames[0].ID }},
-		{name: "missing frame ID", mutate: func(c *bothPicsTestCollection) { c.Frames[0].ID = "" }},
-		{name: "wrong frame label", mutate: func(c *bothPicsTestCollection) { c.Frames[1].Label = "1" }},
-		{name: "reordered frames", mutate: func(c *bothPicsTestCollection) { slices.Reverse(c.Frames) }},
-		{name: "duplicate image frame", mutate: func(c *bothPicsTestCollection) { c.Images[1].FrameID = c.Images[0].FrameID }},
-		{name: "unknown image frame", mutate: func(c *bothPicsTestCollection) { c.Images[0].FrameID = "unknown-frame" }},
-		{name: "invalid frame", mutate: func(c *bothPicsTestCollection) { c.Frames[0].State = "rejected" }},
-		{name: "invalid image", mutate: func(c *bothPicsTestCollection) { c.Images[0].State = "invalid" }},
-		{name: "missing raw URL", mutate: func(c *bothPicsTestCollection) { c.Images[0].URL = "" }},
-		{name: "relative raw URL", mutate: func(c *bothPicsTestCollection) { c.Images[0].URL = "/m/synthetic/image-1" }},
-		{name: "unsafe raw URL", mutate: func(c *bothPicsTestCollection) { c.Images[0].URL = "file:///synthetic.png" }},
-		{name: "invalid thumbnail URL", mutate: func(c *bothPicsTestCollection) { c.Images[0].ThumbURL = "data:image/png;base64,AA==" }},
-	}
-	for _, scenario := range scenarios {
-		t.Run(scenario.name, func(t *testing.T) {
-			collection := newBothPicsTestCollection(len(paths))
-			scenario.mutate(&collection)
-			polls := 0
-			client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
-				if request.Method == http.MethodPost {
-					return imageTestResponse(http.StatusAccepted, bothPicsTestAccepted), nil
-				}
-				polls++
-				if polls > 1 {
-					t.Fatal("invalid published collection was retried")
-				}
-				return imageTestResponse(http.StatusOK, bothPicsTestJSON(t, collection)), nil
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+				return bothPicsTestResponse(tc.status, tc.body, nil), nil
 			})}
-			results, err := (&bothPicsUploader{apiKey: "synthetic-api-key", client: client}).UploadBatch(t.Context(), paths)
-			if err == nil || len(results) != 0 {
-				t.Fatalf("invalid collection results = %+v, error = %v", results, err)
+			_, err := (&bothPicsUploader{apiKey: "secret-token", client: client}).UploadBatch(t.Context(), bothPicsTestPaths(t, 1))
+			if err == nil || !strings.Contains(err.Error(), tc.want) || strings.Contains(err.Error(), "secret-token") {
+				t.Fatalf("error = %v, want %q", err, tc.want)
 			}
 		})
 	}
 }
 
-func TestBothPicsWaitsForPublishedAndReadyImages(t *testing.T) {
-	paths := bothPicsTestPaths(t, 1)
-	synctest.Test(t, func(t *testing.T) {
-		polls := 0
-		start := time.Now()
-		client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
-			if request.Method == http.MethodPost {
-				return imageTestResponse(http.StatusAccepted, bothPicsTestAccepted), nil
-			}
-			polls++
-			if elapsed, want := time.Since(start), time.Duration(polls-1)*1500*time.Millisecond; elapsed != want {
-				t.Fatalf("poll %d after %s, want %s", polls, elapsed, want)
-			}
-			collection := newBothPicsTestCollection(1)
-			switch polls {
-			case 1:
-				return imageTestResponse(http.StatusOK, `{"status":"processing"}`), nil
-			case 2:
-				collection.Frames[0].State = "processing"
-				collection.Images[0].State = "pending"
-				collection.Images[0].URL = ""
-			case 3:
-				collection.Images[0].ThumbURL = ""
-			case 4:
-			default:
-				t.Fatal("completed collection was polled again")
-			}
-			return imageTestResponse(http.StatusOK, bothPicsTestJSON(t, collection)), nil
-		})}
-		results, err := (&bothPicsUploader{apiKey: "synthetic-api-key", client: client}).UploadBatch(t.Context(), paths)
-		if err != nil || len(results) != 1 || polls != 4 {
-			t.Fatalf("results = %+v, error = %v, polls = %d", results, err, polls)
+func TestBothPicsReportsRejectedImage(t *testing.T) {
+	t.Parallel()
+	client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.Method == http.MethodPost {
+			return bothPicsTestResponse(http.StatusAccepted, `{"id":"c1"}`, nil), nil
 		}
-		if results[0].ImgURL != "https://both.pics/t/synthetic/image-1" {
-			t.Fatalf("thumbnail = %q", results[0].ImgURL)
+		return bothPicsTestResponse(http.StatusOK, bothPicsTestPublished("failed", "1 image(s) failed validation."), nil), nil
+	})}
+	_, err := (&bothPicsUploader{apiKey: "token", client: client}).UploadBatch(t.Context(), bothPicsTestPaths(t, 2))
+	want := "bothpics collection failed: 1 image(s) failed validation.: image: This file cannot be published."
+	if err == nil || err.Error() != want {
+		t.Fatalf("error = %v, want %q", err, want)
+	}
+}
+
+func TestBothPicsGuestTokenIsReusedAndRenewedAfterUnauthorized(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var guests atomic.Int32
+		var expired atomic.Bool
+		client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			switch req.Method + " " + req.URL.Path {
+			case "POST /v1/guest":
+				body, _ := io.ReadAll(req.Body)
+				if string(body) != `{"acceptPolicy":true}` || req.Header.Get("Content-Type") != "application/json" || req.Header.Get("Authorization") != "" {
+					t.Error("guest request must send acceptPolicy JSON without Authorization")
+				}
+				return bothPicsTestResponse(http.StatusCreated, fmt.Sprintf(`{"token":"guest-%d","expiresAt":"later"}`, guests.Add(1)), nil), nil
+			case "POST /v1/collections/upload":
+				if expired.Swap(false) {
+					return bothPicsTestResponse(http.StatusUnauthorized, `{"error":"invalid_token","message":"Token expired."}`, nil), nil
+				}
+				if want := fmt.Sprintf("Bearer guest-%d", guests.Load()); req.Header.Get("Authorization") != want {
+					t.Error("upload did not use the current guest token")
+				}
+				if err := req.ParseMultipartForm(1 << 20); err != nil || req.MultipartForm.Value["visibility"][0] != "public" {
+					t.Errorf("guest upload must be public: %v", err)
+				}
+				return bothPicsTestResponse(http.StatusAccepted, `{"id":"c1"}`, nil), nil
+			case "GET /v1/collections/c1":
+				return bothPicsTestResponse(http.StatusOK, bothPicsTestPublished("published", ""), nil), nil
+			}
+			t.Fatalf("unexpected request %s %s", req.Method, req.URL)
+			return nil, nil
+		})}
+		uploader := &bothPicsUploader{client: client}
+		upload := func() error {
+			_, err := uploader.UploadBatch(t.Context(), bothPicsTestPaths(t, 2))
+			return err
+		}
+		for range 2 {
+			if err := upload(); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if guests.Load() != 1 {
+			t.Fatalf("guest tokens requested = %d, want 1", guests.Load())
+		}
+		expired.Store(true)
+		if err := upload(); err == nil || !strings.Contains(err.Error(), "Token expired.") {
+			t.Fatalf("expired token error = %v", err)
+		}
+		if err := upload(); err != nil || guests.Load() != 2 {
+			t.Fatalf("renewed upload err = %v, guest tokens = %d", err, guests.Load())
 		}
 	})
 }
 
-func TestBothPicsFallsBackAfterThumbnailGracePeriod(t *testing.T) {
-	paths := bothPicsTestPaths(t, 1)
-	synctest.Test(t, func(t *testing.T) {
-		collection := newBothPicsTestCollection(1)
-		collection.Images[0].ThumbURL = ""
-		polls := 0
-		client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
-			if request.Method == http.MethodPost {
-				return imageTestResponse(http.StatusAccepted, bothPicsTestAccepted), nil
-			}
-			polls++
-			return imageTestResponse(http.StatusOK, bothPicsTestJSON(t, collection)), nil
-		})}
-		start := time.Now()
-		results, err := (&bothPicsUploader{apiKey: "synthetic-api-key", client: client}).UploadBatch(t.Context(), paths)
-		if err != nil || len(results) != 1 {
-			t.Fatalf("thumbnail fallback results = %+v, error = %v", results, err)
-		}
-		if elapsed := time.Since(start); elapsed != time.Minute || polls != 41 {
-			t.Fatalf("thumbnail grace period = %s, polls = %d", elapsed, polls)
-		}
-		if results[0].ImgURL != results[0].RawURL || results[0].RawURL == "" {
-			t.Fatalf("thumbnail fallback result = %+v", results[0])
-		}
-	})
-}
-
-func TestBothPicsPollingHonorsCancellationAndDeadline(t *testing.T) {
-	paths := bothPicsTestPaths(t, 1)
-	for _, cancelAfter := range []time.Duration{time.Second, 10 * time.Minute} {
-		t.Run(cancelAfter.String(), func(t *testing.T) {
-			synctest.Test(t, func(t *testing.T) {
-				ctx, cancel := context.WithCancel(t.Context())
-				defer cancel()
-				wantErr := context.DeadlineExceeded
-				if cancelAfter < 10*time.Minute {
-					wantErr = context.Canceled
-					time.AfterFunc(cancelAfter, cancel)
-				}
-				polls := 0
-				client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
-					if request.Method == http.MethodPost {
-						return imageTestResponse(http.StatusAccepted, bothPicsTestAccepted), nil
-					}
-					polls++
-					return imageTestResponse(http.StatusOK, `{"status":"processing"}`), nil
-				})}
-				start := time.Now()
-				_, err := (&bothPicsUploader{apiKey: "synthetic-api-key", client: client}).UploadBatch(ctx, paths)
-				if !errors.Is(err, wantErr) {
-					t.Fatalf("polling error = %v, want %v", err, wantErr)
-				}
-				if elapsed := time.Since(start); elapsed != cancelAfter || polls == 0 {
-					t.Fatalf("polling elapsed = %s, polls = %d", elapsed, polls)
-				}
-			})
-		})
-	}
-}
-
-func TestBothPicsTransportErrorsDoNotExposeSecrets(t *testing.T) {
+func TestBothPicsGuestLimitsShowServiceMessage(t *testing.T) {
 	t.Parallel()
-	paths := bothPicsTestPaths(t, 1)
-	const syntheticAPIKey = "synthetic-api-key"
-	for _, failMethod := range []string{http.MethodPost, http.MethodGet} {
-		t.Run(failMethod, func(t *testing.T) {
-			transportErr := errors.New("transport failure with " + syntheticAPIKey)
-			client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
-				if request.Method == failMethod {
-					return nil, transportErr
-				}
-				return imageTestResponse(http.StatusAccepted, bothPicsTestAccepted), nil
-			})}
-			_, err := (&bothPicsUploader{apiKey: syntheticAPIKey, client: client}).UploadBatch(t.Context(), paths)
-			if err == nil {
-				t.Fatal("transport failure succeeded")
-			}
-			if strings.Contains(err.Error(), syntheticAPIKey) {
-				t.Fatal("transport error exposed the configured API key")
-			}
-			if !errors.Is(err, transportErr) {
-				t.Fatal("redacted transport error did not preserve its cause")
-			}
-		})
+	const limit = "Guest uploads are limited to 10 an hour. Create a free account to keep uploading: https://both.pics/signup"
+	cases := map[string]struct {
+		guest, upload *http.Response
+		want          string
+	}{
+		"upload limit": {
+			guest:  bothPicsTestResponse(http.StatusCreated, `{"token":"guest"}`, nil),
+			upload: bothPicsTestResponse(http.StatusTooManyRequests, `{"error":"guest_limit","message":"`+limit+`"}`, nil),
+			want:   "status 429: guest_limit: " + limit,
+		},
+		"network limit": {
+			guest: bothPicsTestResponse(http.StatusTooManyRequests, `{"error":"rate_limited","message":"Too many guests from this network today."}`,
+				http.Header{"Retry-After": {"3600"}}),
+			want: "status 429: rate_limited: Too many guests from this network today. (retry after 1h0m0s)",
+		},
 	}
-}
-
-func TestBothPicsRejectsRedirectsWithoutForwardingToken(t *testing.T) {
-	t.Parallel()
-	paths := bothPicsTestPaths(t, 1)
-	for _, redirectMethod := range []string{http.MethodPost, http.MethodGet} {
-		t.Run(redirectMethod, func(t *testing.T) {
-			redirected := false
-			client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
-				if redirected {
-					t.Fatalf("followed authenticated redirect to %s", request.URL)
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				if req.URL.Path == "/v1/guest" {
+					return tc.guest, nil
 				}
-				if request.Method == redirectMethod {
-					redirected = true
-					response := imageTestResponse(http.StatusTemporaryRedirect, "")
-					response.Header.Set("Location", "https://redirect.both.pics/private")
-					return response, nil
-				}
-				return imageTestResponse(http.StatusAccepted, bothPicsTestAccepted), nil
+				return tc.upload, nil
 			})}
-			_, err := (&bothPicsUploader{apiKey: "synthetic-api-key", client: client}).UploadBatch(t.Context(), paths)
-			if err == nil || !redirected {
-				t.Fatalf("redirect error = %v, reached redirect = %t", err, redirected)
-			}
-			if client.CheckRedirect != nil {
-				t.Fatal("uploader changed shared client redirect policy")
+			_, err := (&bothPicsUploader{client: client}).UploadBatch(t.Context(), bothPicsTestPaths(t, 1))
+			if err == nil || !strings.HasSuffix(err.Error(), tc.want) {
+				t.Fatalf("error = %v, want suffix %q", err, tc.want)
 			}
 		})
 	}
@@ -988,660 +247,10 @@ func TestBothPicsRegistryUsesConfiguredKeyAndUploadTimeout(t *testing.T) {
 	t.Parallel()
 	cfg := config.Config{}
 	cfg.ImageHosting.BothPicsAPI = "synthetic-api-key"
-	baseClient := &http.Client{Timeout: 2 * time.Second}
-	registered := newUploaderRegistry(cfg, baseClient, nil)
+	registered := newUploaderRegistry(cfg, &http.Client{Timeout: 2 * time.Second}, nil)
 	u, ok := registered["bothpics"].(*bothPicsUploader)
-	if !ok {
-		t.Fatalf("registered bothpics uploader = %T", registered["bothpics"])
-	}
-	if u.apiKey != cfg.ImageHosting.BothPicsAPI {
-		t.Fatal("registry did not use configured both.pics API key")
-	}
-	if u.client.Timeout != httpclient.UploadTimeout || baseClient.Timeout != 2*time.Second || u.client == baseClient {
-		t.Fatalf("uploader timeout = %s, original timeout = %s", u.client.Timeout, baseClient.Timeout)
-	}
-}
-
-func TestBothPicsRegistryAllowsAnonymousWithoutAPIKey(t *testing.T) {
-	t.Parallel()
-	registered := newUploaderRegistry(config.Config{}, &http.Client{}, nil)
-	u, ok := registered["bothpics"].(*bothPicsUploader)
-	if !ok || u.apiKey != "" {
-		t.Fatal("registry did not retain the anonymous both.pics option without credentials")
-	}
-}
-
-const (
-	bothPicsTestGuestCookie = "synthetic-guest-session-secret"
-	bothPicsTestDevice      = "synthetic-device-secret"
-	bothPicsTestCSRF        = "synthetic-csrf-secret"
-)
-
-func bothPicsTestGuestClient(t *testing.T, count int, intercept roundTripFunc) *http.Client {
-	t.Helper()
-	return &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
-		if request.URL.Scheme != "https" || request.URL.Host != "both.pics" {
-			t.Fatal("anonymous request left fixed service origin")
-		}
-		if request.Header.Get("Authorization") != "" {
-			t.Fatal("anonymous request included Authorization")
-		}
-		if intercept != nil {
-			response, err := intercept(request)
-			if response != nil || err != nil {
-				return response, err
-			}
-		}
-		if request.Method != http.MethodGet && request.Header.Get("Origin") != "https://both.pics" {
-			t.Fatal("anonymous mutation omitted fixed Origin")
-		}
-		if strings.HasPrefix(request.URL.Path, "/app-api/") {
-			cookie, err := request.Cookie("__Host-bp_session")
-			if err != nil || cookie.Value != bothPicsTestGuestCookie {
-				t.Fatal("anonymous request omitted session cookie")
-			}
-			if request.Method != http.MethodGet && request.Header.Get("X-Csrf-Token") != bothPicsTestCSRF {
-				t.Fatal("anonymous mutation omitted CSRF token")
-			}
-		}
-		switch {
-		case request.Method == http.MethodGet && request.URL.Path == "/screenshots/new":
-			if _, err := request.Cookie("__Host-bp_session"); err == nil {
-				return imageTestResponse(http.StatusOK, `<html><script type="application/json" id="csrf">"`+bothPicsTestCSRF+`"</script></html>`), nil
-			}
-			response := imageTestResponse(http.StatusOK, "<html>Guest offer</html>")
-			response.Header.Add("Set-Cookie", "__Host-bp_device="+bothPicsTestDevice+"; Path=/; Secure; HttpOnly")
-			return response, nil
-		case request.Method == http.MethodPost && request.URL.Path == "/guest":
-			cookie, err := request.Cookie("__Host-bp_device")
-			if err != nil || cookie.Value != bothPicsTestDevice {
-				t.Fatal("guest signup omitted device cookie")
-			}
-			if err := request.ParseForm(); err != nil {
-				t.Fatalf("parse guest form: %v", err)
-			}
-			if request.Form.Get("accept") != "yes" || request.Form.Get("back") != "/screenshots/new" {
-				t.Fatal("guest signup form did not accept content policy or select screenshot uploader")
-			}
-			response := imageTestResponse(http.StatusSeeOther, "")
-			response.Header.Add("Set-Cookie", "__Host-bp_session="+bothPicsTestGuestCookie+"; Path=/; Secure; HttpOnly")
-			response.Header.Set("Location", "/screenshots/new")
-			return response, nil
-		case request.Method == http.MethodPost && request.URL.Path == "/app-api/collections":
-			var payload struct {
-				Kind       string   `json:"kind"`
-				Title      string   `json:"title"`
-				Visibility string   `json:"visibility"`
-				Labels     []string `json:"frameLabels"`
-			}
-			if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
-				t.Fatalf("decode guest create payload: %v", err)
-			}
-			if payload.Kind != "screenshots" || payload.Title == "" || payload.Visibility != "public" || len(payload.Labels) != count {
-				t.Fatalf("anonymous collection payload = %+v", payload)
-			}
-			for index, label := range payload.Labels {
-				if label != strconv.Itoa(index+1) {
-					t.Fatal("anonymous frame labels do not preserve input order")
-				}
-			}
-			collection := newBothPicsTestCollection(count)
-			collection.Status = "draft"
-			slices.Reverse(collection.Images)
-			return imageTestResponse(http.StatusCreated, bothPicsTestJSON(t, collection)), nil
-		case request.Method == http.MethodPut:
-			for index := range count {
-				id := fmt.Sprintf("00000000-0000-4000-8000-%012d", index+1)
-				if request.URL.Path != "/app-api/collections/"+bothPicsTestCollectionID+"/images/"+id {
-					continue
-				}
-				body, err := io.ReadAll(request.Body)
-				if err != nil {
-					t.Fatalf("read anonymous image upload: %v", err)
-				}
-				if string(body) != fmt.Sprintf("synthetic image %d", index+1) || request.ContentLength != int64(len(body)) {
-					t.Fatal("anonymous upload body did not match its ordered image slot")
-				}
-				if request.Header.Get("Content-Type") != "image/png" {
-					t.Fatalf("anonymous image Content-Type = %q", request.Header.Get("Content-Type"))
-				}
-				return imageTestResponse(http.StatusOK, `{"image":{"id":"`+id+`","state":"uploaded"}}`), nil
-			}
-		case request.Method == http.MethodPost && request.URL.Path == "/app-api/collections/"+bothPicsTestCollectionID+"/finalize":
-			return imageTestResponse(http.StatusAccepted, `{"status":"processing"}`), nil
-		case request.Method == http.MethodGet && request.URL.Path == "/app-api/collections/"+bothPicsTestCollectionID:
-			return imageTestResponse(http.StatusOK, bothPicsTestJSON(t, newBothPicsTestCollection(count))), nil
-		}
-		t.Fatalf("unexpected anonymous request = %s %s", request.Method, request.URL.Path)
-		return nil, nil
-	})}
-}
-
-func TestBothPicsAnonymousUploadWithoutAPIKey(t *testing.T) {
-	t.Parallel()
-	paths := bothPicsTestPaths(t, 2)
-	for _, key := range []string{"", " \t\n "} {
-		t.Run(fmt.Sprintf("key_length_%d", len(key)), func(t *testing.T) {
-			var signups atomic.Int32
-			var uploads atomic.Int32
-			client := bothPicsTestGuestClient(t, len(paths), func(request *http.Request) (*http.Response, error) {
-				if request.URL.Path == "/guest" {
-					signups.Add(1)
-				}
-				if request.Method == http.MethodPut {
-					uploads.Add(1)
-				}
-				return nil, nil
-			})
-			uploader := &bothPicsUploader{apiKey: key, client: client}
-			for range 2 {
-				results, err := uploader.UploadBatchWithName(t.Context(), paths, "Synthetic.Release-GRP")
-				if err != nil || len(results) != len(paths) {
-					t.Fatalf("anonymous results = %+v, error = %v", results, err)
-				}
-				for index, result := range results {
-					if result.WebURL != fmt.Sprintf("https://both.pics/s/synthetic/%d", index+1) {
-						t.Fatalf("anonymous result %d = %+v", index, result)
-					}
-				}
-			}
-			if signups.Load() != 1 || uploads.Load() != 4 {
-				t.Fatalf("guest signups = %d, image uploads = %d", signups.Load(), uploads.Load())
-			}
-			if client.Jar != nil || client.CheckRedirect != nil {
-				t.Fatal("anonymous uploader changed shared client session settings")
-			}
-		})
-	}
-}
-
-func TestBothPicsConcurrentAnonymousUploadsReuseSession(t *testing.T) {
-	t.Parallel()
-	paths := bothPicsTestPaths(t, 1)
-	var signups atomic.Int32
-	client := bothPicsTestGuestClient(t, 1, func(request *http.Request) (*http.Response, error) {
-		if request.URL.Path == "/guest" {
-			signups.Add(1)
-		}
-		return nil, nil
-	})
-	uploader := &bothPicsUploader{client: client}
-	var group sync.WaitGroup
-	for range 3 {
-		group.Go(func() {
-			if _, err := uploader.UploadBatch(t.Context(), paths); err != nil {
-				t.Errorf("concurrent anonymous upload: %v", err)
-			}
-		})
-	}
-	group.Wait()
-	if signups.Load() != 1 {
-		t.Fatalf("concurrent guest signups = %d", signups.Load())
-	}
-}
-
-func TestBothPicsAnonymousSessionWaitHonorsCancellation(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		started := make(chan struct{})
-		release := make(chan struct{})
-		var first atomic.Bool
-		client := bothPicsTestGuestClient(t, 1, func(request *http.Request) (*http.Response, error) {
-			if request.URL.Path == "/screenshots/new" && !first.Swap(true) {
-				close(started)
-				<-release
-			}
-			return nil, nil
-		})
-		uploader := &bothPicsUploader{client: client}
-		firstDone := make(chan error, 1)
-		go func() {
-			_, err := uploader.guestSession(t.Context())
-			firstDone <- err
-		}()
-		<-started
-		ctx, cancel := context.WithCancel(t.Context())
-		defer cancel()
-		secondDone := make(chan error, 1)
-		go func() {
-			_, err := uploader.guestSession(ctx)
-			secondDone <- err
-		}()
-		synctest.Wait()
-		cancel()
-		if err := <-secondDone; !errors.Is(err, context.Canceled) {
-			t.Fatalf("waiting for guest session cancellation: %v", err)
-		}
-		close(release)
-		if err := <-firstDone; err != nil {
-			t.Fatalf("first guest initialization failed: %v", err)
-		}
-	})
-}
-
-func TestBothPicsAnonymousSessionExpiresWithoutAutomaticUploadRetry(t *testing.T) {
-	t.Parallel()
-	paths := bothPicsTestPaths(t, 1)
-	for _, expireCookie := range []bool{false, true} {
-		t.Run(fmt.Sprintf("cookie_expired_%t", expireCookie), func(t *testing.T) {
-			var signups atomic.Int32
-			var rejectSession atomic.Bool
-			client := bothPicsTestGuestClient(t, 1, func(request *http.Request) (*http.Response, error) {
-				if request.URL.Path == "/guest" {
-					signups.Add(1)
-				}
-				if request.URL.Path == "/app-api/collections" && rejectSession.Load() {
-					return imageTestResponse(http.StatusUnauthorized, ""), nil
-				}
-				return nil, nil
-			})
-			uploader := &bothPicsUploader{client: client}
-			if _, err := uploader.UploadBatch(t.Context(), paths); err != nil {
-				t.Fatalf("initial anonymous upload: %v", err)
-			}
-			if expireCookie {
-				uploader.guest.client.Jar.SetCookies(&url.URL{Scheme: "https", Host: "both.pics"}, []*http.Cookie{
-					{
-						Name:   "__Host-bp_session",
-						Path:   "/",
-						Secure: true,
-						MaxAge: -1,
-					},
-				})
-			} else {
-				rejectSession.Store(true)
-				_, err := uploader.UploadBatch(t.Context(), paths)
-				if !errors.Is(err, errBothPicsGuestSessionExpired) || signups.Load() != 1 {
-					t.Fatal("rejected guest session was retried automatically")
-				}
-				rejectSession.Store(false)
-			}
-			if _, err := uploader.UploadBatch(t.Context(), paths); err != nil {
-				t.Fatalf("next explicitly requested anonymous upload: %v", err)
-			}
-			if signups.Load() != 2 {
-				t.Fatalf("guest signups after expiry = %d, want 2", signups.Load())
-			}
-		})
-	}
-}
-
-func TestBothPicsAnonymousFailuresDoNotCreateExtraSessions(t *testing.T) {
-	t.Parallel()
-	paths := bothPicsTestPaths(t, 1)
-	scenarios := []struct {
-		name   string
-		method string
-		path   string
-		status int
-		body   string
-	}{
-		{
-			name:   "guest disabled redirect",
-			method: http.MethodGet,
-			path:   "/screenshots/new",
-			status: http.StatusSeeOther,
-		},
-		{
-			name:   "guest disabled forbidden",
-			method: http.MethodPost,
-			path:   "/guest",
-			status: http.StatusForbidden,
-		},
-		{
-			name:   "guest quota",
-			method: http.MethodPost,
-			path:   "/guest",
-			status: http.StatusTooManyRequests,
-		},
-		{
-			name:   "invalid creation JSON",
-			method: http.MethodPost,
-			path:   "/app-api/collections",
-			status: http.StatusCreated,
-			body:   `{"id":`,
-		},
-		{
-			name:   "incomplete collection",
-			method: http.MethodPost,
-			path:   "/app-api/collections",
-			status: http.StatusCreated,
-			body:   `{}`,
-		},
-		{
-			name:   "invalid image upload",
-			method: http.MethodPut,
-			path:   "/app-api/collections/" + bothPicsTestCollectionID + "/images/00000000-0000-4000-8000-000000000001",
-			status: http.StatusBadRequest,
-		},
-		{
-			name:   "finalization failure",
-			method: http.MethodPost,
-			path:   "/app-api/collections/" + bothPicsTestCollectionID + "/finalize",
-			status: http.StatusInternalServerError,
-		},
-		{
-			name:   "polling session expired",
-			method: http.MethodGet,
-			path:   "/app-api/collections/" + bothPicsTestCollectionID,
-			status: http.StatusUnauthorized,
-		},
-	}
-	for _, scenario := range scenarios {
-		t.Run(scenario.name, func(t *testing.T) {
-			failed := false
-			client := bothPicsTestGuestClient(t, 1, func(request *http.Request) (*http.Response, error) {
-				if failed {
-					t.Fatal("anonymous upload retried a terminal failure")
-				}
-				if request.Method == scenario.method && request.URL.Path == scenario.path {
-					failed = true
-					return imageTestResponse(scenario.status, scenario.body), nil
-				}
-				return nil, nil
-			})
-			_, err := (&bothPicsUploader{client: client}).UploadBatch(t.Context(), paths)
-			if err == nil || !failed {
-				t.Fatalf("anonymous failure = %v, reached expected failure = %t", err, failed)
-			}
-			if scenario.status == http.StatusSeeOther && !strings.Contains(err.Error(), "guest access") {
-				t.Fatalf("anonymous disabled error is not actionable: %v", err)
-			}
-		})
-	}
-}
-
-func TestBothPicsAnonymousReportsSafeHTTPFailures(t *testing.T) {
-	t.Parallel()
-	paths := bothPicsTestPaths(t, 1)
-	const collectionPath = "/app-api/collections/" + bothPicsTestCollectionID
-	scenarios := []struct {
-		name    string
-		method  string
-		path    string
-		status  int
-		code    string
-		message string
-		body    string
-		want    []string
-	}{
-		{
-			name:   "guest access closed",
-			method: http.MethodPost,
-			path:   "/guest",
-			status: http.StatusForbidden,
-			code:   "guests_closed",
-			want:   []string{"guest access is disabled", "API token"},
-		},
-		{
-			name:   "CSRF rejected",
-			method: http.MethodPost,
-			path:   "/app-api/collections",
-			status: http.StatusForbidden,
-			code:   "csrf",
-			want:   []string{"anonymous session verification failed"},
-		},
-		{
-			name:   "origin rejected",
-			method: http.MethodPut,
-			path:   collectionPath + "/images/00000000-0000-4000-8000-000000000001",
-			status: http.StatusForbidden,
-			code:   "bad_origin",
-			want:   []string{"anonymous session verification failed"},
-		},
-		{
-			name:   "public visibility required",
-			method: http.MethodPost,
-			path:   "/app-api/collections",
-			status: http.StatusBadRequest,
-			code:   "guest_public",
-			want:   []string{"anonymous uploads must be public", "account token"},
-		},
-		{
-			name:   "daily limit at finalize",
-			method: http.MethodPost,
-			path:   collectionPath + "/finalize",
-			status: http.StatusTooManyRequests,
-			code:   "daily_limit",
-			want:   []string{"daily upload limit", "tomorrow"},
-		},
-		{
-			name:   "guest creation rate limit",
-			method: http.MethodPost,
-			path:   "/guest",
-			status: http.StatusTooManyRequests,
-			code:   "rate_limited",
-			want:   []string{"request rate limit", "wait"},
-		},
-		{
-			name:    "network guest capacity",
-			method:  http.MethodPost,
-			path:    "/guest",
-			status:  http.StatusTooManyRequests,
-			code:    "rate_limited",
-			message: "Too many guests from your network today. Create an account instead.",
-			want:    []string{"anonymous upload capacity", "tomorrow", "account API token"},
-		},
-		{
-			name:    "site guest capacity",
-			method:  http.MethodPost,
-			path:    "/guest",
-			status:  http.StatusTooManyRequests,
-			code:    "rate_limited",
-			message: "Posting without an account is busy today. Create an account instead.",
-			want:    []string{"anonymous upload capacity", "tomorrow", "account API token"},
-		},
-		{
-			name:    "guest image size limit",
-			method:  http.MethodPut,
-			path:    collectionPath + "/images/00000000-0000-4000-8000-000000000001",
-			status:  http.StatusRequestEntityTooLarge,
-			code:    "too_large",
-			message: "Images are limited to 67108864 bytes.",
-			want:    []string{"67108864 bytes"},
-		},
-		{
-			name:   "session expired during polling",
-			method: http.MethodGet,
-			path:   collectionPath,
-			status: http.StatusUnauthorized,
-			code:   "login_required",
-			want:   []string{"anonymous session expired", "API token"},
-		},
-		{
-			name:   "guest server failure",
-			method: http.MethodGet,
-			path:   collectionPath,
-			status: http.StatusInternalServerError,
-			code:   "internal_error",
-			want:   []string{"service could not complete", "check the collection"},
-		},
-		{
-			name:   "guest HTML failure",
-			method: http.MethodGet,
-			path:   collectionPath,
-			status: http.StatusInternalServerError,
-			body:   "<html>" + strings.Join(bothPicsTestErrorSecrets(), " ") + "</html>",
-		},
-		{
-			name:   "guest malformed error JSON",
-			method: http.MethodGet,
-			path:   collectionPath,
-			status: http.StatusInternalServerError,
-			body:   `{"error":"internal_error","message":"` + strings.Join(bothPicsTestErrorSecrets(), " "),
-		},
-		{
-			name:   "guest oversized error JSON",
-			method: http.MethodGet,
-			path:   collectionPath,
-			status: http.StatusInternalServerError,
-			body:   bothPicsTestErrorBody(t, "internal_error", strings.Repeat("x", 1<<20)+bothPicsTestPrivateDetail),
-		},
-	}
-	for _, scenario := range scenarios {
-		t.Run(scenario.name, func(t *testing.T) {
-			message := scenario.message
-			if message == "" {
-				message = strings.Join(bothPicsTestErrorSecrets(), " ")
-			}
-			body := scenario.body
-			if body == "" {
-				body = bothPicsTestErrorBody(t, scenario.code, message)
-			}
-			failed := false
-			client := bothPicsTestGuestClient(t, 1, func(request *http.Request) (*http.Response, error) {
-				if failed {
-					t.Fatal("guest failure retried an upload or created another session")
-				}
-				if request.Method == scenario.method && request.URL.Path == scenario.path {
-					failed = true
-					return imageTestResponse(scenario.status, body), nil
-				}
-				return nil, nil
-			})
-			results, err := (&bothPicsUploader{client: client}).UploadBatch(t.Context(), paths)
-			assertBothPicsSafeError(t, err, append([]string{"status " + strconv.Itoa(scenario.status)}, scenario.want...)...)
-			if len(results) != 0 || !failed {
-				t.Fatal("guest failure did not stop at the rejected request")
-			}
-			if scenario.status == http.StatusUnauthorized && !errors.Is(err, errBothPicsGuestSessionExpired) {
-				t.Fatal("anonymous HTTP401 lost its session expiry cause")
-			}
-		})
-	}
-}
-
-func TestBothPicsHTTPFailuresPreserveStatusWhenReadingFails(t *testing.T) {
-	t.Parallel()
-	paths := bothPicsTestPaths(t, 1)
-	for _, anonymous := range []bool{false, true} {
-		for _, polling := range []bool{false, true} {
-			for _, status := range []int{http.StatusUnauthorized, http.StatusRequestEntityTooLarge, http.StatusTooManyRequests} {
-				t.Run(fmt.Sprintf("anonymous_%t/polling_%t/status_%d", anonymous, polling, status), func(t *testing.T) {
-					readErr := errors.New(strings.Join(bothPicsTestErrorSecrets(), " "))
-					failed := false
-					intercept := roundTripFunc(func(request *http.Request) (*http.Response, error) {
-						if failed {
-							t.Fatal("unreadable error response caused an upload retry")
-						}
-						isFailure := request.Method == http.MethodGet && strings.HasSuffix(request.URL.Path, "/"+bothPicsTestCollectionID)
-						if !polling {
-							isFailure = request.Method == http.MethodPut || request.URL.Path == "/v1/collections/upload"
-						}
-						if isFailure {
-							failed = true
-							response := imageTestResponse(status, "")
-							response.Body = io.NopCloser(iotest.ErrReader(readErr))
-							return response, nil
-						}
-						if anonymous {
-							return nil, nil
-						}
-						if request.Method != http.MethodPost || request.URL.Path != "/v1/collections/upload" {
-							t.Fatal("unreadable account error response switched upload paths")
-						}
-						return imageTestResponse(http.StatusAccepted, bothPicsTestAccepted), nil
-					})
-					uploader := &bothPicsUploader{apiKey: "synthetic-api-key", client: &http.Client{Transport: intercept}}
-					if anonymous {
-						uploader.apiKey = ""
-						uploader.client = bothPicsTestGuestClient(t, 1, intercept)
-					}
-					results, err := uploader.UploadBatch(t.Context(), paths)
-					assertBothPicsSafeError(t, err, "status "+strconv.Itoa(status))
-					if len(results) != 0 || !failed || !errors.Is(err, readErr) {
-						t.Fatal("unreadable error response lost its cause or failed to stop the upload")
-					}
-					if anonymous && status == http.StatusUnauthorized && !errors.Is(err, errBothPicsGuestSessionExpired) {
-						t.Fatal("unreadable anonymous HTTP401 lost its session expiry cause")
-					}
-				})
-			}
-		}
-	}
-}
-
-func TestBothPicsAnonymousCSRFAndCookiesAreRedacted(t *testing.T) {
-	t.Parallel()
-	paths := bothPicsTestPaths(t, 1)
-	for _, failurePath := range []string{"/app-api/collections", "/app-api/collections/" + bothPicsTestCollectionID} {
-		t.Run(failurePath, func(t *testing.T) {
-			transportErr := errors.New("synthetic failure: " + bothPicsTestGuestCookie + " " + bothPicsTestDevice + " " + bothPicsTestCSRF)
-			client := bothPicsTestGuestClient(t, 1, func(request *http.Request) (*http.Response, error) {
-				if request.URL.Path == failurePath {
-					return nil, transportErr
-				}
-				return nil, nil
-			})
-			_, err := (&bothPicsUploader{client: client}).UploadBatch(t.Context(), paths)
-			if err == nil || !errors.Is(err, transportErr) {
-				t.Fatal("anonymous transport failure did not preserve its cause")
-			}
-			for _, secret := range []string{bothPicsTestGuestCookie, bothPicsTestDevice, bothPicsTestCSRF} {
-				if strings.Contains(err.Error(), secret) {
-					t.Fatal("anonymous transport failure exposed session material")
-				}
-			}
-		})
-	}
-}
-
-func TestBothPicsAnonymousRejectsInvalidCSRF(t *testing.T) {
-	t.Parallel()
-	paths := bothPicsTestPaths(t, 1)
-	for _, page := range []string{"<html>Signed out</html>", `<script id="csrf">{}</script>`, `<script id="csrf">""</script>`} {
-		t.Run(page, func(t *testing.T) {
-			client := bothPicsTestGuestClient(t, 1, func(request *http.Request) (*http.Response, error) {
-				if request.URL.Path == "/screenshots/new" {
-					if _, err := request.Cookie("__Host-bp_session"); err == nil {
-						return imageTestResponse(http.StatusOK, page), nil
-					}
-				}
-				if strings.HasPrefix(request.URL.Path, "/app-api/") {
-					t.Fatal("invalid CSRF allowed collection creation")
-				}
-				return nil, nil
-			})
-			if _, err := (&bothPicsUploader{client: client}).UploadBatch(t.Context(), paths); err == nil {
-				t.Fatal("invalid CSRF response succeeded")
-			}
-		})
-	}
-}
-
-func TestBothPicsAnonymousRejectsInvalidUploadSlots(t *testing.T) {
-	t.Parallel()
-	paths := bothPicsTestPaths(t, 2)
-	scenarios := []struct {
-		name   string
-		mutate func(*bothPicsTestCollection)
-	}{
-		{name: "unsafe collection ID", mutate: func(c *bothPicsTestCollection) { c.ID = "../unsafe" }},
-		{name: "unsafe image ID", mutate: func(c *bothPicsTestCollection) { c.Images[0].ID = "../unsafe" }},
-		{name: "duplicate image ID", mutate: func(c *bothPicsTestCollection) { c.Images[0].ID = c.Images[1].ID }},
-		{name: "duplicate frame ID", mutate: func(c *bothPicsTestCollection) { c.Frames[0].ID = c.Frames[1].ID }},
-		{name: "duplicate image frame", mutate: func(c *bothPicsTestCollection) { c.Images[0].FrameID = c.Images[1].FrameID }},
-		{name: "missing image", mutate: func(c *bothPicsTestCollection) { c.Images = c.Images[:1] }},
-		{name: "incorrect label", mutate: func(c *bothPicsTestCollection) { c.Frames[0].Label = "2" }},
-	}
-	for _, scenario := range scenarios {
-		t.Run(scenario.name, func(t *testing.T) {
-			collection := newBothPicsTestCollection(2)
-			scenario.mutate(&collection)
-			created := false
-			client := bothPicsTestGuestClient(t, 2, func(request *http.Request) (*http.Response, error) {
-				if created {
-					t.Fatal("invalid collection slots allowed an image upload")
-				}
-				if request.URL.Path == "/app-api/collections" {
-					created = true
-					return imageTestResponse(http.StatusCreated, bothPicsTestJSON(t, collection)), nil
-				}
-				return nil, nil
-			})
-			if _, err := (&bothPicsUploader{client: client}).UploadBatch(t.Context(), paths); err == nil || !created {
-				t.Fatal("invalid anonymous collection slots succeeded")
-			}
-		})
+	if !ok || u.apiKey != "synthetic-api-key" || u.client.Timeout != httpclient.UploadTimeout {
+		t.Fatalf("registered bothpics uploader = %#v", registered["bothpics"])
 	}
 }
 

@@ -1164,30 +1164,20 @@ export const createSettingsRenderers = (context: SettingsRenderContext) => {
           ) : (
             <div className={settingsStyle.grid}>
               {Array.from(requiredKeys).map((key) =>
-                key === "BothPicsAPI" ? (
-                  <label className={settingsStyle.field} key={key}>
-                    <span>{sectionFieldMeta.ImageHosting.BothPicsAPI.label}</span>
-                    <input
-                      className={settingsInputClass}
-                      type="password"
-                      autoComplete="off"
-                      value={String(imageCfg[key] ?? "")}
-                      onChange={(event) =>
-                        updateConfigValue(["ImageHosting", key], event.target.value)
-                      }
-                    />
-                  </label>
-                ) : (
-                  renderField(key, imageCfg[key] as ConfigValue, ["ImageHosting", key])
+                renderField(
+                  key,
+                  imageCfg[key] as ConfigValue,
+                  ["ImageHosting", key],
+                  sectionFieldMeta.ImageHosting[key],
                 ),
               )}
             </div>
           )}
           {requiredKeys.has("BothPicsAPI") ? (
             <p className="text-muted-foreground">
-              Leave blank for anonymous uploads listed on both.pics. To use your account, enter a
-              token with read and upload scopes. Anonymous uploads accept the both.pics content
-              policy; only upload images you have the right to share.
+              both.pics: with a token (read and upload scopes) uploads are unlisted on your account.
+              Left blank, upbrr uses a guest token, which accepts the both.pics content policy;
+              guest uploads are public, can&apos;t be deleted, and are limited to 10 an hour.
             </p>
           ) : null}
         </div>
