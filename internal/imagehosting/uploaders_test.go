@@ -211,18 +211,26 @@ func TestBothPicsGuestTokenIsReusedAndRenewedAfterUnauthorized(t *testing.T) {
 func TestBothPicsGuestLimitsShowServiceMessage(t *testing.T) {
 	t.Parallel()
 	const limit = "Guest uploads are limited to 10 an hour. Create a free account to keep uploading: https://both.pics/signup"
+	type reply struct {
+		status int
+		body   string
+		header http.Header
+	}
 	cases := map[string]struct {
-		guest, upload *http.Response
+		guest, upload reply
 		want          string
 	}{
 		"upload limit": {
-			guest:  bothPicsTestResponse(http.StatusCreated, `{"token":"guest"}`, nil),
-			upload: bothPicsTestResponse(http.StatusTooManyRequests, `{"error":"guest_limit","message":"`+limit+`"}`, nil),
+			guest:  reply{status: http.StatusCreated, body: `{"token":"guest"}`},
+			upload: reply{status: http.StatusTooManyRequests, body: `{"error":"guest_limit","message":"` + limit + `"}`},
 			want:   "status 429: guest_limit: " + limit,
 		},
 		"network limit": {
-			guest: bothPicsTestResponse(http.StatusTooManyRequests, `{"error":"rate_limited","message":"Too many guests from this network today."}`,
-				http.Header{"Retry-After": {"3600"}}),
+			guest: reply{
+				status: http.StatusTooManyRequests,
+				body:   `{"error":"rate_limited","message":"Too many guests from this network today."}`,
+				header: http.Header{"Retry-After": {"3600"}},
+			},
 			want: "status 429: rate_limited: Too many guests from this network today. (retry after 1h0m0s)",
 		},
 	}
@@ -230,10 +238,11 @@ func TestBothPicsGuestLimitsShowServiceMessage(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 			client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				r := tc.upload
 				if req.URL.Path == "/v1/guest" {
-					return tc.guest, nil
+					r = tc.guest
 				}
-				return tc.upload, nil
+				return bothPicsTestResponse(r.status, r.body, r.header), nil
 			})}
 			_, err := (&bothPicsUploader{client: client}).UploadBatch(t.Context(), bothPicsTestPaths(t, 1))
 			if err == nil || !strings.HasSuffix(err.Error(), tc.want) {

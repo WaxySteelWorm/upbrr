@@ -313,7 +313,9 @@ func waitForBothPicsCollection(ctx context.Context, client *http.Client, path st
 		body, err := bothPicsDo(client, req, headers, http.StatusOK)
 		var collection bothPicsCollection
 		if err == nil {
-			err = json.Unmarshal(body, &collection)
+			if err = json.Unmarshal(body, &collection); err != nil {
+				err = fmt.Errorf("image hosting: bothpics invalid collection response: %w", err)
+			}
 		}
 		var statusErr *bothPicsStatusError
 		switch {
