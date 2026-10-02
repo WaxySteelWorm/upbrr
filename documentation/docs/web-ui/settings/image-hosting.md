@@ -14,6 +14,7 @@ Choose up to six hosts in preferred order. The Web UI reveals credential fields 
 | Host         | Required setting         |
 | ------------ | ------------------------ |
 | ImgBB        | API key                  |
+| both.pics    | None; API token optional |
 | ImgBox       | None                     |
 | Pixhost      | None                     |
 | Lensdump     | API key                  |
@@ -27,6 +28,12 @@ Choose up to six hosts in preferred order. The Web UI reveals credential fields 
 | UTPPM        | API key                  |
 
 When an allowed host fails, upbrr can try the next eligible configured host. A host rejected by the target tracker's policy is skipped regardless of its global position.
+
+For **both.pics**, select **both.pics** in a host slot. Leave **both.pics API token (optional)** blank for anonymous uploads with **public links that are not listed on both.pics**. Anonymous uploads require the service to accept guest uploads. Uploading anonymously accepts the both.pics content policy and confirms you have the right to share the images. Guest sessions are not retained after restarting upbrr, so use an account token if you need to manage uploaded images later.
+
+To save uploads to your account in an **unlisted collection**, create a both.pics API token with both `read` and `upload` scopes and enter it in that field. In YAML configuration, use host ID `bothpics` and the optional `image_hosting.bothpics_api` field. Configured tokens follow upbrr's existing image-host credential masking and encrypted storage/export settings.
+
+Each both.pics upload batch creates a collection of up to 500 screenshots, subject to the service's upload limits. upbrr waits up to 10 minutes for image validation to finish.
 
 ## Additional hosts
 

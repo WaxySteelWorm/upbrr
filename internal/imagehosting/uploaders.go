@@ -52,8 +52,9 @@ func newUploaderRegistry(cfg config.Config, client *http.Client, registry *track
 	client = httpclient.CloneWithTimeout(client, httpclient.UploadTimeout)
 	hdbConfig := ownedHostTrackerConfig(cfg, registry, "hdb")
 	return map[string]uploader{
-		"imgbb":  &imgbbUploader{apiKey: cfg.ImageHosting.ImgBBAPI, client: client},
-		"imgbox": &imgboxUploader{client: client},
+		"bothpics": &bothPicsUploader{apiKey: cfg.ImageHosting.BothPicsAPI, client: client},
+		"imgbb":    &imgbbUploader{apiKey: cfg.ImageHosting.ImgBBAPI, client: client},
+		"imgbox":   &imgboxUploader{client: client},
 		"hdb": &hdbUploader{
 			username: hdbConfig.Username,
 			passkey:  hdbConfig.Passkey,
