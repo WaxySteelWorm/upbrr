@@ -1164,10 +1164,32 @@ export const createSettingsRenderers = (context: SettingsRenderContext) => {
           ) : (
             <div className={settingsStyle.grid}>
               {Array.from(requiredKeys).map((key) =>
-                renderField(key, imageCfg[key] as ConfigValue, ["ImageHosting", key]),
+                key === "BothPicsAPI" ? (
+                  <label className={settingsStyle.field} key={key}>
+                    <span>{sectionFieldMeta.ImageHosting.BothPicsAPI.label}</span>
+                    <input
+                      className={settingsInputClass}
+                      type="password"
+                      autoComplete="off"
+                      value={String(imageCfg[key] ?? "")}
+                      onChange={(event) =>
+                        updateConfigValue(["ImageHosting", key], event.target.value)
+                      }
+                    />
+                  </label>
+                ) : (
+                  renderField(key, imageCfg[key] as ConfigValue, ["ImageHosting", key])
+                ),
               )}
             </div>
           )}
+          {requiredKeys.has("BothPicsAPI") ? (
+            <p className="text-muted-foreground">
+              Leave blank for anonymous uploads listed on both.pics. To use your account, enter a
+              token with read and upload scopes. Anonymous uploads accept the both.pics content
+              policy; only upload images you have the right to share.
+            </p>
+          ) : null}
         </div>
 
         <div className={settingsStyle.subgroup}>
