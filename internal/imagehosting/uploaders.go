@@ -224,17 +224,14 @@ func bothPicsUpload(ctx context.Context, client *http.Client, token string, imag
 		"title":      string(title[:min(len(title), 120)]),
 		"frameCount": strconv.Itoa(len(imagePaths)),
 	}
-	headers := map[string]string{
-		"Authorization": "Bearer " + token,
-		"User-Agent":    bothPicsUserAgent(),
-		"Accept":        "application/json",
-	}
-	body, status, err := postMultipartWithFields(ctx, client, bothPicsOrigin+"/v1/collections/upload", fields, files, headers)
+	req, err := newMultipartRequest(ctx, bothPicsOrigin+"/v1/collections/upload", fields, files)
 	if err != nil {
 		return nil, err
 	}
-	if status != http.StatusAccepted {
-		return nil, bothPicsHTTPError(status, body, "")
+	headers := map[string]string{"Authorization": "Bearer " + token}
+	body, err := bothPicsDo(client, req, headers, http.StatusAccepted)
+	if err != nil {
+		return nil, err
 	}
 	var accepted struct {
 		ID string `json:"id"`
@@ -1626,6 +1623,28 @@ func postMultipartWithFields(
 	fileFields map[string]string,
 	headers map[string]string,
 ) ([]byte, int, error) {
+	req, err := newMultipartRequest(ctx, target, fields, fileFields)
+	if err != nil {
+		return nil, 0, err
+	}
+	for key, value := range headers {
+		req.Header.Set(key, value)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		closeResponseBody(resp)
+		return nil, 0, fmt.Errorf("image hosting: send multipart request to %s: %w", target, err)
+	}
+	bodyBytes, err := readLimitedAndCloseResponseBody(resp)
+	if err != nil {
+		return nil, resp.StatusCode, err
+	}
+	return bodyBytes, resp.StatusCode, nil
+}
+
+// newMultipartRequest builds a POST with sorted fields, then files in sorted
+// field order.
+func newMultipartRequest(ctx context.Context, target string, fields map[string]string, fileFields map[string]string) (*http.Request, error) {
 	body := &bytes.Buffer{}
 	writer := multipart.NewWriter(body)
 	fieldKeys := make([]string, 0, len(fields))
@@ -1636,7 +1655,7 @@ func postMultipartWithFields(
 	for _, key := range fieldKeys {
 		value := fields[key]
 		if err := writer.WriteField(key, value); err != nil {
-			return nil, 0, fmt.Errorf("image hosting: write multipart field %q: %w", key, err)
+			return nil, fmt.Errorf("image hosting: write multipart field %q: %w", key, err)
 		}
 	}
 	fileFieldKeys := make([]string, 0, len(fileFields))
@@ -1648,44 +1667,31 @@ func postMultipartWithFields(
 		filePath := fileFields[fileField]
 		file, err := os.Open(filePath)
 		if err != nil {
-			return nil, 0, fmt.Errorf("image hosting: open multipart file: %w", err)
+			return nil, fmt.Errorf("image hosting: open multipart file: %w", err)
 		}
 		part, err := writer.CreateFormFile(fileField, filepath.Base(filePath))
 		if err != nil {
 			_ = file.Close()
-			return nil, 0, fmt.Errorf("image hosting: create multipart file %q: %w", fileField, err)
+			return nil, fmt.Errorf("image hosting: create multipart file %q: %w", fileField, err)
 		}
 		if _, err := io.Copy(part, file); err != nil {
 			_ = file.Close()
-			return nil, 0, fmt.Errorf("image hosting: copy multipart file: %w", err)
+			return nil, fmt.Errorf("image hosting: copy multipart file: %w", err)
 		}
 		if err := file.Close(); err != nil {
-			return nil, 0, fmt.Errorf("image hosting: close multipart file: %w", err)
+			return nil, fmt.Errorf("image hosting: close multipart file: %w", err)
 		}
 	}
 	if err := writer.Close(); err != nil {
-		return nil, 0, fmt.Errorf("image hosting: close multipart writer: %w", err)
+		return nil, fmt.Errorf("image hosting: close multipart writer: %w", err)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, target, body)
 	if err != nil {
-		return nil, 0, fmt.Errorf("image hosting: create multipart request for %s: %w", target, err)
+		return nil, fmt.Errorf("image hosting: create multipart request for %s: %w", target, err)
 	}
 	req.Header.Set("Content-Type", writer.FormDataContentType())
-	for key, value := range headers {
-		req.Header.Set(key, value)
-	}
-
-	resp, err := client.Do(req)
-	if err != nil {
-		closeResponseBody(resp)
-		return nil, 0, fmt.Errorf("image hosting: send multipart request to %s: %w", target, err)
-	}
-	bodyBytes, err := readLimitedAndCloseResponseBody(resp)
-	if err != nil {
-		return nil, resp.StatusCode, err
-	}
-	return bodyBytes, resp.StatusCode, nil
+	return req, nil
 }
 
 func postMultipartRepeatedFileField(

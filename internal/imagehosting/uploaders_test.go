@@ -218,9 +218,13 @@ func TestBothPicsGuestLimitsShowServiceMessage(t *testing.T) {
 		want          string
 	}{
 		"upload limit": {
-			guest:  reply{status: http.StatusCreated, body: `{"token":"guest"}`},
-			upload: reply{status: http.StatusTooManyRequests, body: `{"error":"guest_limit","message":"` + limit + `"}`},
-			want:   "status 429: guest_limit: " + limit,
+			guest: reply{status: http.StatusCreated, body: `{"token":"guest"}`},
+			upload: reply{
+				status: http.StatusTooManyRequests,
+				body:   `{"error":"guest_limit","message":"` + limit + `"}`,
+				header: http.Header{"Retry-After": {"1800"}},
+			},
+			want: "status 429: guest_limit: " + limit + " (retry after 30m0s)",
 		},
 		"network limit": {
 			guest: reply{
