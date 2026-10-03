@@ -85,7 +85,7 @@ func TestBothPicsTokenUploadPollsUntilPublished(t *testing.T) {
 					t.Fatal(err)
 				}
 				form := req.MultipartForm
-				if form.Value["kind"][0] != "screenshots" || form.Value["visibility"][0] != "unlisted" ||
+				if form.Value["kind"][0] != "screenshots" || form.Value["visibility"] != nil ||
 					form.Value["frameCount"][0] != "2" || form.Value["title"][0] != "Movie 2024" {
 					t.Errorf("fields = %v", form.Value)
 				}
@@ -174,9 +174,6 @@ func TestBothPicsGuestTokenIsReusedAndRenewedAfterUnauthorized(t *testing.T) {
 				}
 				if want := fmt.Sprintf("Bearer guest-%d", guests.Load()); req.Header.Get("Authorization") != want {
 					t.Error("upload did not use the current guest token")
-				}
-				if err := req.ParseMultipartForm(1 << 20); err != nil || req.MultipartForm.Value["visibility"][0] != "public" {
-					t.Errorf("guest upload must be public: %v", err)
 				}
 				return bothPicsTestResponse(http.StatusAccepted, `{"id":"c1"}`, nil), nil
 			case "GET /v1/collections/c1":

@@ -1175,9 +1175,9 @@ export const createSettingsRenderers = (context: SettingsRenderContext) => {
           )}
           {requiredKeys.has("BothPicsAPI") ? (
             <p className="text-muted-foreground">
-              both.pics: with a token (read and upload scopes) uploads are unlisted on your account.
-              Left blank, upbrr uses a guest token, which accepts the both.pics content policy;
-              guest uploads are public, can&apos;t be deleted, and are limited to 10 an hour.
+              The both.pics token is optional (it needs the read and upload scopes). Without one,
+              upbrr uploads as a guest, which accepts the both.pics content policy; guest uploads
+              can&apos;t be deleted and are limited to 10 an hour.
             </p>
           ) : null}
         </div>

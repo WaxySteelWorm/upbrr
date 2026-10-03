@@ -18,6 +18,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -101,20 +102,19 @@ func ownedHostTrackerConfig(cfg config.Config, registry *trackers.Registry, host
 
 const (
 	bothPicsOrigin       = "https://both.pics"
-	bothPicsMaxImages    = 500
 	bothPicsPollInterval = 1500 * time.Millisecond
 	bothPicsPollTimeout  = 10 * time.Minute
 	// Guest tokens last 24 hours; renew early so a long poll never outlives one.
 	bothPicsGuestTokenLifetime = 23 * time.Hour
-	// Thumbnails are made just after publishing; the official client waits up to a minute for them.
+	// Thumbnails can trail publishing by a few seconds; the official client waits up to a minute.
 	bothPicsThumbnailGrace = time.Minute
 	// Collection responses describe every image, so they outgrow maxResponseBodyPreviewBytes.
 	bothPicsMaxResponseBytes int64 = 4 << 20
 )
 
-// bothPicsUploader publishes screenshot galleries through the token API
-// (https://both.pics/docs/api). Without a configured account token it uses a
-// guest token, whose uploads are always public.
+// bothPicsUploader publishes screenshot galleries through the both.pics API
+// (https://both.pics/docs/api), with the configured account token or else a
+// guest token.
 type bothPicsUploader struct {
 	apiKey       string
 	client       *http.Client
@@ -130,6 +130,14 @@ type bothPicsStatusError struct {
 
 func (e *bothPicsStatusError) Error() string { return e.message }
 
+type bothPicsImage struct {
+	FrameID  string `json:"frameId"`
+	URL      string `json:"url"`
+	ThumbURL string `json:"thumbUrl"`
+	SHA256   string `json:"sha256"`
+	Error    string `json:"error"`
+}
+
 type bothPicsCollection struct {
 	Status  string `json:"status"`
 	URL     string `json:"url"`
@@ -137,13 +145,7 @@ type bothPicsCollection struct {
 	Frames  []struct {
 		ID string `json:"id"`
 	} `json:"frames"`
-	Images []struct {
-		FrameID  string `json:"frameId"`
-		URL      string `json:"url"`
-		ThumbURL string `json:"thumbUrl"`
-		SHA256   string `json:"sha256"`
-		Error    string `json:"error"`
-	} `json:"images"`
+	Images []bothPicsImage `json:"images"`
 }
 
 func (u *bothPicsUploader) Upload(ctx context.Context, imagePath string) (uploadResult, error) {
@@ -159,25 +161,18 @@ func (u *bothPicsUploader) UploadBatch(ctx context.Context, imagePaths []string)
 }
 
 func (u *bothPicsUploader) UploadBatchWithName(ctx context.Context, imagePaths []string, galleryName string) ([]uploadResult, error) {
-	if len(imagePaths) == 0 || len(imagePaths) > bothPicsMaxImages {
-		return nil, fmt.Errorf("image hosting: bothpics upload requires between 1 and %d images", bothPicsMaxImages)
-	}
-	title := []rune(strings.TrimSpace(galleryName))
-	if len(title) == 0 {
-		title = []rune("upbrr screenshots")
-	}
-	title = title[:min(len(title), 120)]
 	// Never forward a bearer token through redirects.
 	client := *u.client
 	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
-	if token := strings.TrimSpace(u.apiKey); token != "" {
-		return bothPicsUpload(ctx, &client, token, "unlisted", imagePaths, string(title))
+	token := strings.TrimSpace(u.apiKey)
+	if token != "" {
+		return bothPicsUpload(ctx, &client, token, imagePaths, galleryName)
 	}
 	token, err := u.guestBearer(ctx, &client)
 	if err != nil {
 		return nil, err
 	}
-	results, err := bothPicsUpload(ctx, &client, token, "public", imagePaths, string(title))
+	results, err := bothPicsUpload(ctx, &client, token, imagePaths, galleryName)
 	var statusErr *bothPicsStatusError
 	if errors.As(err, &statusErr) && statusErr.status == http.StatusUnauthorized {
 		// Guest token expired early; the next batch requests a new one.
@@ -210,24 +205,23 @@ func (u *bothPicsUploader) guestBearer(ctx context.Context, client *http.Client)
 	var response struct {
 		Token string `json:"token"`
 	}
-	if err := json.Unmarshal(body, &response); err != nil || strings.TrimSpace(response.Token) == "" {
+	if err := json.Unmarshal(body, &response); err != nil || response.Token == "" {
 		return "", errors.New("image hosting: bothpics guest response missing token")
 	}
-	u.guestToken = strings.TrimSpace(response.Token)
-	u.guestExpires = time.Now().Add(bothPicsGuestTokenLifetime)
+	u.guestToken, u.guestExpires = response.Token, time.Now().Add(bothPicsGuestTokenLifetime)
 	return u.guestToken, nil
 }
 
-func bothPicsUpload(ctx context.Context, client *http.Client, token, visibility string, imagePaths []string, title string) ([]uploadResult, error) {
+func bothPicsUpload(ctx context.Context, client *http.Client, token string, imagePaths []string, galleryName string) ([]uploadResult, error) {
 	files := make(map[string]string, len(imagePaths))
 	for index, imagePath := range imagePaths {
 		// postMultipartWithFields sorts file fields; padded names keep input order.
 		files[fmt.Sprintf("file%06d", index)] = imagePath
 	}
+	title := []rune(cmp.Or(strings.TrimSpace(galleryName), "upbrr screenshots"))
 	fields := map[string]string{
 		"kind":       "screenshots",
-		"title":      title,
-		"visibility": visibility,
+		"title":      string(title[:min(len(title), 120)]),
 		"frameCount": strconv.Itoa(len(imagePaths)),
 	}
 	headers := map[string]string{
@@ -245,7 +239,7 @@ func bothPicsUpload(ctx context.Context, client *http.Client, token, visibility 
 	var accepted struct {
 		ID string `json:"id"`
 	}
-	if err := json.Unmarshal(body, &accepted); err != nil || strings.TrimSpace(accepted.ID) == "" {
+	if err := json.Unmarshal(body, &accepted); err != nil || accepted.ID == "" {
 		return nil, errors.New("image hosting: bothpics upload response missing collection id")
 	}
 	return waitForBothPicsCollection(ctx, client, "/v1/collections/"+url.PathEscape(accepted.ID), headers, len(imagePaths))
@@ -253,8 +247,7 @@ func bothPicsUpload(ctx context.Context, client *http.Client, token, visibility 
 
 // bothPicsUserAgent identifies upbrr and its version, as the API asks of clients.
 func bothPicsUserAgent() string {
-	version := cmp.Or(strings.TrimSpace(api.CurrentApplicationInfo().Version), "dev")
-	return "upbrr/" + version + " (+https://github.com/autobrr/upbrr)"
+	return "upbrr/" + cmp.Or(api.CurrentApplicationInfo().Version, "dev") + " (+https://github.com/autobrr/upbrr)"
 }
 
 func bothPicsDo(client *http.Client, req *http.Request, headers map[string]string, want int) ([]byte, error) {
@@ -294,7 +287,7 @@ func bothPicsHTTPError(status int, body []byte, retryAfter string) error {
 	if detail == "" {
 		detail = http.StatusText(status)
 	}
-	if seconds, err := strconv.Atoi(strings.TrimSpace(retryAfter)); err == nil && seconds > 0 {
+	if seconds, err := strconv.Atoi(retryAfter); err == nil && seconds > 0 {
 		detail += fmt.Sprintf(" (retry after %s)", time.Duration(seconds)*time.Second)
 	}
 	return &bothPicsStatusError{status: status, message: fmt.Sprintf("bothpics request failed with status %d: %s", status, detail)}
@@ -327,14 +320,11 @@ func waitForBothPicsCollection(ctx context.Context, client *http.Client, path st
 		case collection.Status == "failed" || collection.Status == "deleted":
 			return nil, collection.failureError()
 		case collection.Status == "published":
-			ready := true
-			for _, image := range collection.Images {
-				ready = ready && image.ThumbURL != ""
-			}
 			if thumbnailDeadline.IsZero() {
 				thumbnailDeadline = time.Now().Add(bothPicsThumbnailGrace)
 			}
-			if ready || !time.Now().Before(thumbnailDeadline) {
+			thumbnailsReady := !slices.ContainsFunc(collection.Images, func(image bothPicsImage) bool { return image.ThumbURL == "" })
+			if thumbnailsReady || time.Now().After(thumbnailDeadline) {
 				return collection.results(count)
 			}
 		}
@@ -355,43 +345,35 @@ func (c *bothPicsCollection) failureError() error {
 	if failure := safeResponseMessage(c.Failure); failure != "" {
 		reasons = append(reasons, failure)
 	}
-	for _, image := range c.Images {
-		if reason := safeResponseMessage(image.Error); reason != "" {
-			reasons = append(reasons, "image: "+reason)
-			break
-		}
+	if index := slices.IndexFunc(c.Images, func(image bothPicsImage) bool { return image.Error != "" }); index >= 0 {
+		reasons = append(reasons, "image: "+safeResponseMessage(c.Images[index].Error))
 	}
 	return errors.New(strings.Join(reasons, ": "))
 }
 
+// results maps published images back to upload order: the thumbnail for
+// embedding, the versioned original (as the official client links it), and
+// the image's own page.
 func (c *bothPicsCollection) results(count int) ([]uploadResult, error) {
-	pageURL := strings.TrimRight(strings.TrimSpace(c.URL), "/")
+	pageURL := strings.TrimRight(c.URL, "/")
 	if len(c.Frames) != count || pageURL == "" {
 		return nil, fmt.Errorf("image hosting: bothpics returned %d images for %d uploads", len(c.Frames), count)
 	}
-	results := make([]uploadResult, 0, count)
+	results := make([]uploadResult, count)
 	for index, frame := range c.Frames {
-		found := false
-		for _, image := range c.Images {
-			if image.FrameID != frame.ID || strings.TrimSpace(image.URL) == "" {
-				continue
-			}
-			// Versioned original, as the official client links it.
-			rawURL := strings.TrimSpace(image.URL)
-			if len(image.SHA256) >= 8 {
-				rawURL += "?v=" + image.SHA256[:8]
-			}
-			thumbnail := cmp.Or(strings.TrimSpace(image.ThumbURL), rawURL)
-			results = append(results, uploadResult{
-				ImgURL: thumbnail,
-				RawURL: rawURL,
-				WebURL: pageURL + "/" + strconv.Itoa(index+1),
-			})
-			found = true
-			break
-		}
-		if !found {
+		at := slices.IndexFunc(c.Images, func(image bothPicsImage) bool { return image.FrameID == frame.ID && image.URL != "" })
+		if at < 0 {
 			return nil, errors.New("image hosting: bothpics published collection is missing an image URL")
+		}
+		image := c.Images[at]
+		rawURL := image.URL
+		if len(image.SHA256) >= 8 {
+			rawURL += "?v=" + image.SHA256[:8]
+		}
+		results[index] = uploadResult{
+			ImgURL: cmp.Or(image.ThumbURL, rawURL),
+			RawURL: rawURL,
+			WebURL: pageURL + "/" + strconv.Itoa(index+1),
 		}
 	}
 	return results, nil
